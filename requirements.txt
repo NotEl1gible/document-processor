@@ -1,0 +1,7 @@
+pymupdf>=1.24
+pillow>=10.0
+numpy>=1.26
+rapidocr-onnxruntime>=1.3
+pytest>=8.0
+# Only needed for --provider anthropic; the whole pipeline runs offline without it.
+anthropic>=0.94

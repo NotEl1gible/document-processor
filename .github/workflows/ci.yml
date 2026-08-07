@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push: { branches: [main] }
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  tests:
+    name: hermetic tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      # No OCR model is downloaded here. Every test uses recorded OCR output instead of a
+      # live engine, so CI is fast and cannot flake on a model version -- while still
+      # guarding the scoring, the validation, the snapping and the degradation ladder.
+      - run: pip install pymupdf pillow numpy pytest
+      - run: python -m pytest -q
+
+      - name: the corpus regenerates deterministically
+        run: |
+          python docproc.py generate --n 8
+          python - <<'PY'
+          import docproc as D
+          rows = D.load_jsonl("docs/truth.jsonl")
+          assert len(rows) == 8, len(rows)
+          for r in rows:
+              assert abs((r["net"] + r["vat"]) - r["total"]) < 0.02, r["doc_id"]
+          print("corpus regenerated; arithmetic closes on every record")
+          PY
+
+      - name: the committed run artifacts still support the README
+        run: python -m pytest -q -k committed_attribution
+
+  ocr:
+    name: full pipeline with a real OCR engine
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install -r requirements.txt
+      - run: python docproc.py generate --n 6
+      # The gates live here: the text-layer ceiling must stay perfect (otherwise the
+      # extractor is the bottleneck and no OCR conclusion means anything), and heavy
+      # degradation must still hurt (otherwise the degradation stopped degrading).
+      - run: python docproc.py attribute --n 6
+      - run: python docproc.py curve

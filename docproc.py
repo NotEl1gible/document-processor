@@ -618,22 +618,161 @@ def cmd_attribute(args):
     return EXIT["GATE_FAILED"] if gates else EXIT["OK"]
 
 
+# ----------------------------------------------------------------------------
+# Invariance — the instrument that needs no labels at all
+# ----------------------------------------------------------------------------
+BACKGROUNDS = {
+    "white":     (1.00, 1.00, 1.00),
+    "cream":     (0.98, 0.96, 0.88),
+    "grey":      (0.85, 0.85, 0.85),
+    "pale blue": (0.86, 0.92, 0.98),
+    "pink":      (0.98, 0.88, 0.90),
+}
+
+
+def cmd_invariance(args):
+    """The same document on five paper colours. Every extracted field must be identical.
+
+    No annotation anywhere: the invariant follows from what a document IS -- changing the
+    paper colour cannot change the amount on an invoice. That is what makes this free, and
+    it is the only instrument here that would still work on a corpus whose ground truth
+    nobody has.
+
+    It is also the concrete form of an earlier measurement. In raw pixel space the same
+    letter on a different background scores 0.762 while a DIFFERENT letter on the same
+    background scores 0.976 -- colour dominates identity. Whether the pipeline has actually
+    learned past that is not an argument to have; it is a number to read.
+    """
+    truth = {r["doc_id"]: r for r in load_jsonl(DOCS_DIR / "truth.jsonl")}
+    ids = sorted(truth)[: args.n]
+    stable, flips, gates = 0, [], []
+
+    print(f"=== invariance to paper colour ({len(ids)} docs x {len(BACKGROUNDS)} "
+          f"backgrounds, {args.level} degradation) ===")
+    for did in ids:
+        outs = {}
+        for name, bg in BACKGROUNDS.items():
+            path = DOCS_DIR / "bg" / f"{did}-{name.replace(' ', '_')}.pdf"
+            render_pdf(truth[did], path, bg=bg)
+            text, _ = ocr_text(degrade(rasterize(path), args.level, seed=3))
+            pred = extract(text, args.provider)
+            if args.snap:
+                pred, _ = snap_record(pred)
+            outs[name] = pred
+        base = outs["white"]
+        moved = {}
+        for n, o in outs.items():
+            if n == "white":
+                continue
+            diff = {f: (base.get(f), o.get(f)) for f in FIELDS if base.get(f) != o.get(f)}
+            if diff:
+                moved[n] = diff
+        if moved:
+            flips.append((did, moved))
+        else:
+            stable += 1
+
+    print(f"  extraction identical across all backgrounds: {rate(stable, len(ids))}")
+    if flips:
+        print()
+        print("  output MOVED when only the paper colour moved:")
+        for did, moved in flips[:4]:
+            for bgname, fields in list(moved.items())[:2]:
+                for f, (a, b) in list(fields.items())[:2]:
+                    print(f"    {did}  on {bgname:<10} {f}: {a!r} -> {b!r}")
+    print()
+    print("  Nothing about these documents changed except the paper colour, so every")
+    print("  difference above is the pipeline reacting to something carrying no information.")
+    print("  No labels were used to detect it.")
+
+    if stable == len(ids) and args.level in ("medium", "heavy"):
+        gates.append(f"perfect invariance at {args.level} degradation -- either the "
+                     f"backgrounds are too similar to be a test, or something is flattening "
+                     f"them to greyscale before OCR ever sees a colour")
+    for g in gates:
+        print()
+        print(f"  GATE FAILED: {g}")
+    return EXIT["GATE_FAILED"] if gates else EXIT["OK"]
+
+
+# ----------------------------------------------------------------------------
+# The curve that decides the economics
+# ----------------------------------------------------------------------------
+def cmd_curve(args):
+    """Confidence threshold -> straight-through share -> errors that escaped.
+
+    Accuracy is the wrong headline. A system that is 99% accurate but cannot say WHICH 1% is
+    wrong has a straight-through rate of ZERO, because everything must be checked. What
+    decides whether a document pipeline pays is this curve, and it is almost never shown.
+
+    Two costs, tracked separately because different people pay them:
+      REVIEW LOAD    documents sent to a human. Paid in salary -- and a reviewer is SLOWER
+                     per document than a typist, because they must read the page AND check
+                     the machine.
+      ESCAPED ERRORS wrong extractions that were auto-approved. Paid downstream in a wrong
+                     payment, and found much later if at all.
+    """
+    path = OUT_DIR / "attribute.jsonl"
+    if not path.exists():
+        print("  run `attribute` first")
+        return EXIT["INFRA"]
+    rows = [r for r in load_jsonl(path) if r["input"] != "text layer (no OCR)"]
+    for r in rows:
+        r["correct"] = int(all(r["hits"].values()))
+
+    print(f"=== straight-through curve ({len(rows)} passes, all degradation levels) ===")
+    print(f"  {'threshold':>10}{'auto-processed':>26}{'escaped errors':>26}{'review':>9}")
+    best = None
+    for th in (0.0, 0.3, 0.5, 0.7, 0.8, 0.9, 0.95, 1.01):
+        auto = [r for r in rows if r["confidence"] >= th]
+        escaped = sum(1 for r in auto if not r["correct"])
+        print(f"  {th:>10.2f}{rate(len(auto), len(rows)):>26}"
+              f"{rate(escaped, max(len(auto), 1)):>26}"
+              f"{(len(rows) - len(auto)) / len(rows):>9.2f}")
+        if escaped == 0 and (best is None or len(auto) > best[1]):
+            best = (th, len(auto))
+
+    print()
+    if best and best[1] > 0:
+        th, n = best
+        print(f"  At threshold {th:.2f} nothing wrong escapes and {n}/{len(rows)} "
+              f"({n/len(rows):.0%}) still go through untouched.")
+    else:
+        print("  NO threshold reaches zero escaped errors on this corpus. That is the honest")
+        print("  answer for a pipeline that includes heavily degraded scans, and it means the")
+        print("  system cannot run unattended at any confidence setting -- which is a product")
+        print("  decision, not a bug to tune away.")
+    print()
+    print("  The confidence is built from CHECKS, not self-report: does the arithmetic close,")
+    print("  are the fields present, is the currency in the list. Deliberately so -- the OCR")
+    print("  engine's own mean score went UP from 0.781 to 0.794 as the page got worse, so a")
+    print("  curve built on it would be smooth, plausible and meaningless.")
+    print()
+    print("  net + vat = total is the load-bearing rule. A schema check cannot catch a misread")
+    print("  digit (18478.33 and 18478.83 are both valid floats); arithmetic that has to close")
+    print("  catches it with no model and no label.")
+    return EXIT["OK"]
+
+
 def main():
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     except Exception:                                   # noqa: BLE001
         pass
     ap = argparse.ArgumentParser(description="Document processing pipeline")
-    ap.add_argument("command", choices=["generate", "attribute"])
+    ap.add_argument("command",
+                    choices=["generate", "attribute", "invariance", "curve"])
     ap.add_argument("--n", type=int, default=40)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--level", default="light", choices=list(DEGRADATIONS))
     ap.add_argument("--provider", default="mock", choices=["mock", "anthropic"])
     ap.add_argument("--snap", action="store_true",
                     help="snap vendor/currency to the closed vocabulary by "
                          "character-trigram cosine before scoring")
     args = ap.parse_args()
     load_dotenv()
-    return {"generate": cmd_generate, "attribute": cmd_attribute}[args.command](args)
+    return {"generate": cmd_generate, "attribute": cmd_attribute,
+            "invariance": cmd_invariance, "curve": cmd_curve}[args.command](args)
 
 
 if __name__ == "__main__":
