@@ -4,3 +4,4 @@ __pycache__/
 .pytest_cache/
 docs/pdf/
 NOTES.local.md
+demo.pdf
